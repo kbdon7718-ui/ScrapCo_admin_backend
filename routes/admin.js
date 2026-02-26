@@ -1,6 +1,12 @@
 const express = require('express');
 
-const { createAnonClientWithJwt, createServiceClient } = require('../supabase/client');
+const {
+	createAnonClientWithJwt,
+	createAuthServiceClient,
+	createCustomerServiceClient,
+	createVendorServiceClient,
+	createServiceClient,
+} = require('../supabase/client');
 const { getBearerToken } = require('../supabase/auth');
 
 const router = express.Router();
@@ -49,7 +55,7 @@ async function requireAdmin(req, res) {
 	}
 
 	try {
-		const supabase = createServiceClient();
+		const supabase = createAuthServiceClient();
 		const { data: profile, error } = await supabase
 			.from('profiles')
 			.select('role')
@@ -71,6 +77,29 @@ async function requireAdmin(req, res) {
 		res.status(500).json({ success: false, error: e?.message || 'Admin check failed' });
 		return null;
 	}
+}
+
+function toAdminPickupStatus(dbStatus) {
+	const s = String(dbStatus || '').toUpperCase();
+	if (s === 'COMPLETED') return 'Completed';
+	if (s === 'CANCELLED') return 'Cancelled';
+	if (s === 'ASSIGNED' || s === 'ON_THE_WAY') return 'Assigned';
+	return 'Pending';
+}
+
+function safeNumber(v, fallback = 0) {
+	const n = Number(v);
+	return Number.isFinite(n) ? n : fallback;
+}
+
+function normalizeSlug(input) {
+	const s = String(input || '').trim();
+	return s
+		.toLowerCase()
+		.replace(/[^a-z0-9\s-]/g, '')
+		.replace(/\s+/g, '-')
+		.replace(/-+/g, '-')
+		.replace(/^-|-$/g, '');
 }
 
 async function getActiveRateByType(supabase) {
@@ -108,7 +137,7 @@ router.get('/vendors', async (req, res) => {
 	if (!admin) return;
 
 	try {
-		const supabase = createServiceClient();
+		const supabase = createVendorServiceClient();
 		const { data, error } = await supabase.from('vendor_backends').select('*').limit(500);
 		if (error) return res.status(400).json({ success: false, error: error.message });
 
@@ -128,13 +157,134 @@ router.get('/vendors', async (req, res) => {
 	}
 });
 
+// GET /api/admin/godowns
+router.get('/godowns', async (req, res) => {
+	const admin = await requireAdmin(req, res);
+	if (!admin) return;
+
+	try {
+		const supabase = createVendorServiceClient();
+		// We keep this generic: you can create a `godowns` table in the vendor project.
+		const { data, error } = await supabase.from('godowns').select('*').limit(500);
+		if (error) {
+			return res.status(400).json({
+				success: false,
+				error: error.message,
+				hint:
+					"If you use a different table name, update admin_backend/routes/admin.js. Expected table: public.godowns in the VENDOR project.",
+			});
+		}
+		return res.json({ success: true, godowns: data || [] });
+	} catch (e) {
+		console.error('Admin godowns failed', e);
+		return res.status(500).json({ success: false, error: e?.message || 'Admin request failed' });
+	}
+});
+
+// GET /api/admin/pickups
+router.get('/pickups', async (req, res) => {
+	const admin = await requireAdmin(req, res);
+	if (!admin) return;
+
+	const limitRaw = req.query?.limit;
+	const limit = Math.max(1, Math.min(500, Number(limitRaw ?? 200) || 200));
+
+	try {
+		const supabase = createCustomerServiceClient();
+
+		const { data: pickups, error } = await supabase
+			.from('pickups')
+			.select(
+				'id,status,address,latitude,longitude,time_slot,assigned_vendor_ref,assignment_expires_at,cancelled_at,completed_at,created_at,customer_id,' +
+					'pickup_items(id,estimated_quantity,scrap_type_id,scrap_types(name))'
+			)
+			.order('created_at', { ascending: false })
+			.limit(limit);
+		if (error) return res.status(400).json({ success: false, error: error.message });
+
+		// Enrich customer names/phones (best-effort)
+		const customerIds = Array.from(new Set((pickups || []).map((p) => p.customer_id).filter(Boolean)));
+		let customersById = new Map();
+		if (customerIds.length > 0) {
+			try {
+				const { data: profiles, error: profErr } = await supabase
+					.from('profiles')
+					.select('id,full_name,phone,email')
+					.in('id', customerIds)
+					.limit(500);
+				if (!profErr) {
+					customersById = new Map((profiles || []).map((r) => [r.id, r]));
+				}
+			} catch {
+				// ignore enrichment errors
+			}
+		}
+
+		// Optional: compute an estimated amount using active rates
+		let rateByType = new Map();
+		try {
+			rateByType = await getActiveRateByType(supabase);
+		} catch {
+			rateByType = new Map();
+		}
+
+		const rows = (pickups || []).map((p) => {
+			const items = Array.isArray(p.pickup_items) ? p.pickup_items : [];
+			const firstName = items?.[0]?.scrap_types?.name || null;
+			const scrapLabel =
+				items.length === 0
+					? '—'
+					: items
+						.map((it) => it?.scrap_types?.name)
+						.filter(Boolean)
+						.join(', ');
+
+			const weightKg = items.reduce((acc, it) => acc + safeNumber(it?.estimated_quantity, 0), 0);
+			const amountInr = items.reduce((acc, it) => {
+				const r = rateByType.get(it?.scrap_type_id);
+				const rate = safeNumber(r?.rate_per_kg, 0);
+				return acc + safeNumber(it?.estimated_quantity, 0) * rate;
+			}, 0);
+
+			const customer = customersById.get(p.customer_id) || null;
+
+			return {
+				id: p.id,
+				createdAt: p.created_at,
+				status: toAdminPickupStatus(p.status),
+				dbStatus: p.status,
+				customerId: p.customer_id,
+				customerName: customer?.full_name || customer?.email || null,
+				customerPhone: customer?.phone || null,
+				address: p.address || null,
+				timeSlot: p.time_slot || null,
+				vendorRef: p.assigned_vendor_ref || null,
+				scrapType: firstName || scrapLabel,
+				weightKg,
+				amountInr: Math.round(amountInr),
+				items: items.map((it) => ({
+					id: it.id,
+					scrapTypeId: it.scrap_type_id,
+					scrapTypeName: it?.scrap_types?.name || null,
+					estimatedQuantityKg: safeNumber(it.estimated_quantity, 0),
+				})),
+			};
+		});
+
+		return res.json({ success: true, pickups: rows });
+	} catch (e) {
+		console.error('Admin pickups failed', e);
+		return res.status(500).json({ success: false, error: e?.message || 'Admin request failed' });
+	}
+});
+
 // GET /api/admin/scrap-types
 router.get('/scrap-types', async (req, res) => {
 	const admin = await requireAdmin(req, res);
 	if (!admin) return;
 
 	try {
-		const supabase = createServiceClient();
+		const supabase = createCustomerServiceClient();
 
 		const { data: types, error: typesErr } = await supabase
 			.from('scrap_types')
@@ -170,7 +320,7 @@ router.post('/scrap-types', async (req, res) => {
 	if (!name) return res.status(400).json({ success: false, error: 'name is required' });
 
 	try {
-		const supabase = createServiceClient();
+		const supabase = createCustomerServiceClient();
 		const { data, error } = await supabase
 			.from('scrap_types')
 			.insert([{ name }])
@@ -196,7 +346,7 @@ router.patch('/scrap-types/:id', async (req, res) => {
 	if (!name) return res.status(400).json({ success: false, error: 'name is required' });
 
 	try {
-		const supabase = createServiceClient();
+		const supabase = createCustomerServiceClient();
 		const { data, error } = await supabase
 			.from('scrap_types')
 			.update({ name })
@@ -228,7 +378,7 @@ router.post('/scrap-rates', async (req, res) => {
 	}
 
 	try {
-		const supabase = createServiceClient();
+		const supabase = createCustomerServiceClient();
 
 		const { error: deactErr } = await supabase
 			.from('scrap_rates')
@@ -261,13 +411,133 @@ router.post('/scrap-rates', async (req, res) => {
 	}
 });
 
+// -----------------------------
+// Blog posts (website content)
+// -----------------------------
+
+// GET /api/admin/blog
+// Admin list (includes drafts)
+router.get('/blog', async (req, res) => {
+	const admin = await requireAdmin(req, res);
+	if (!admin) return;
+
+	try {
+		const supabase = createServiceClient();
+		const { data, error } = await supabase
+			.from('blog_posts')
+			.select('id,title,slug,excerpt,content,featured_image,is_published,created_at,updated_at')
+			.order('updated_at', { ascending: false });
+
+		if (error) return res.status(400).json({ success: false, error: error.message || 'Could not fetch posts' });
+		return res.json({ success: true, count: (data || []).length, posts: data || [] });
+	} catch (e) {
+		console.error('Admin blog list failed', e);
+		return res.status(500).json({ success: false, error: e?.message || 'Admin request failed' });
+	}
+});
+
+// POST /api/admin/blog
+router.post('/blog', async (req, res) => {
+	const admin = await requireAdmin(req, res);
+	if (!admin) return;
+
+	try {
+		const title = String(req.body?.title || '').trim();
+		const slugRaw = req.body?.slug;
+		const excerpt = req.body?.excerpt !== undefined ? (req.body.excerpt != null ? String(req.body.excerpt) : null) : null;
+		const content = req.body?.content !== undefined ? (req.body.content != null ? String(req.body.content) : '') : '';
+		const featuredImage = req.body?.featured_image !== undefined ? (req.body.featured_image != null ? String(req.body.featured_image) : null) : null;
+		const isPublished = Boolean(req.body?.is_published);
+
+		if (!title) return res.status(400).json({ success: false, error: 'title is required' });
+		const slug = normalizeSlug(slugRaw || title);
+		if (!slug) return res.status(400).json({ success: false, error: 'slug is required' });
+
+		const supabase = createServiceClient();
+		const { data, error } = await supabase
+			.from('blog_posts')
+			.insert([
+				{
+					title,
+					slug,
+					excerpt,
+					content,
+					featured_image: featuredImage,
+					is_published: isPublished,
+				},
+			])
+			.select('id,title,slug,excerpt,content,featured_image,is_published,created_at,updated_at')
+			.maybeSingle();
+
+		if (error) {
+			const msg = error.message || 'Could not create post';
+			if (/duplicate key value|blog_posts_slug_key/i.test(msg)) {
+				return res.status(409).json({ success: false, error: 'slug already exists' });
+			}
+			return res.status(400).json({ success: false, error: msg });
+		}
+
+		return res.status(201).json({ success: true, post: data });
+	} catch (e) {
+		console.error('Admin blog create failed', e);
+		return res.status(500).json({ success: false, error: e?.message || 'Admin request failed' });
+	}
+});
+
+// PATCH /api/admin/blog/:id
+router.patch('/blog/:id', async (req, res) => {
+	const admin = await requireAdmin(req, res);
+	if (!admin) return;
+
+	try {
+		const id = String(req.params.id || '').trim();
+		if (!id) return res.status(400).json({ success: false, error: 'id is required' });
+
+		const patch = {};
+		if (req.body?.title !== undefined) patch.title = String(req.body.title || '').trim();
+		if (req.body?.slug !== undefined) patch.slug = normalizeSlug(req.body.slug);
+		if (req.body?.excerpt !== undefined) patch.excerpt = req.body.excerpt != null ? String(req.body.excerpt) : null;
+		if (req.body?.content !== undefined) patch.content = req.body.content != null ? String(req.body.content) : '';
+		if (req.body?.featured_image !== undefined) patch.featured_image = req.body.featured_image != null ? String(req.body.featured_image) : null;
+		if (req.body?.is_published !== undefined) patch.is_published = Boolean(req.body.is_published);
+
+		if (Object.keys(patch).length === 0) {
+			return res.status(400).json({ success: false, error: 'No fields to update' });
+		}
+		if (patch.title != null && !patch.title) return res.status(400).json({ success: false, error: 'title cannot be empty' });
+		if (patch.slug != null && !patch.slug) return res.status(400).json({ success: false, error: 'slug cannot be empty' });
+
+		const supabase = createServiceClient();
+		const { data, error } = await supabase
+			.from('blog_posts')
+			.update(patch)
+			.eq('id', id)
+			.select('id,title,slug,excerpt,content,featured_image,is_published,created_at,updated_at')
+			.maybeSingle();
+
+		if (error) {
+			const msg = error.message || 'Could not update post';
+			if (/duplicate key value|blog_posts_slug_key/i.test(msg)) {
+				return res.status(409).json({ success: false, error: 'slug already exists' });
+			}
+			return res.status(400).json({ success: false, error: msg });
+		}
+		if (!data) return res.status(404).json({ success: false, error: 'post not found' });
+
+		return res.json({ success: true, post: data });
+	} catch (e) {
+		console.error('Admin blog update failed', e);
+		return res.status(500).json({ success: false, error: e?.message || 'Admin request failed' });
+	}
+});
+
 // GET /api/admin/site-stats
 router.get('/site-stats', async (req, res) => {
 	const admin = await requireAdmin(req, res);
 	if (!admin) return;
 
 	try {
-		const supabase = createServiceClient();
+		const supabase = createAuthServiceClient();
 		const { data, error } = await supabase
 			.from('site_stats')
 			.select('id,label,value,sort_order,is_active')
@@ -307,7 +577,7 @@ router.post('/site-stats', async (req, res) => {
 	}
 
 	try {
-		const supabase = createServiceClient();
+		const supabase = createAuthServiceClient();
 		const row = { label, value, sort_order: sortOrder, is_active: isActive };
 		const { data, error } = await supabase
 			.from('site_stats')
@@ -357,7 +627,7 @@ router.patch('/site-stats/:id', async (req, res) => {
 	}
 
 	try {
-		const supabase = createServiceClient();
+		const supabase = createAuthServiceClient();
 		const { data, error } = await supabase
 			.from('site_stats')
 			.update(patch)
@@ -389,7 +659,7 @@ router.get('/testimonials', async (req, res) => {
 	if (!admin) return;
 
 	try {
-		const supabase = createServiceClient();
+		const supabase = createAuthServiceClient();
 		const { data, error } = await supabase
 			.from('testimonials')
 			.select('id,name,quote,role,rating,sort_order,is_active')
@@ -436,7 +706,7 @@ router.post('/testimonials', async (req, res) => {
 	}
 
 	try {
-		const supabase = createServiceClient();
+		const supabase = createAuthServiceClient();
 		const row = {
 			name,
 			quote,
@@ -504,7 +774,7 @@ router.patch('/testimonials/:id', async (req, res) => {
 	}
 
 	try {
-		const supabase = createServiceClient();
+		const supabase = createAuthServiceClient();
 		const { data, error } = await supabase
 			.from('testimonials')
 			.update(patch)
@@ -528,6 +798,66 @@ router.patch('/testimonials/:id', async (req, res) => {
 		});
 	} catch (e) {
 		console.error('Admin update testimonial failed', e);
+		return res.status(500).json({ success: false, error: e?.message || 'Admin request failed' });
+	}
+});
+
+// GET /api/admin/users (auth users + profile roles)
+router.get('/users', async (req, res) => {
+	const admin = await requireAdmin(req, res);
+	if (!admin) return;
+
+	try {
+		const supabase = createAuthServiceClient();
+		const { data, error } = await supabase.auth.admin.listUsers({ perPage: 200, page: 1 });
+		if (error) return res.status(400).json({ success: false, error: error.message });
+
+		const users = data?.users || [];
+		const ids = users.map((u) => u.id);
+		let rolesById = new Map();
+		try {
+			const { data: profiles, error: pErr } = await supabase.from('profiles').select('id,role').in('id', ids).limit(500);
+			if (!pErr) rolesById = new Map((profiles || []).map((p) => [p.id, p.role]));
+		} catch {
+			rolesById = new Map();
+		}
+
+		const rows = users.map((u) => ({
+			id: u.id,
+			email: u.email || null,
+			phone: u.phone || null,
+			createdAt: u.created_at || null,
+			role: rolesById.get(u.id) || null,
+		}));
+
+		return res.json({ success: true, users: rows });
+	} catch (e) {
+		console.error('Admin users failed', e);
+		return res.status(500).json({ success: false, error: e?.message || 'Admin request failed' });
+	}
+});
+
+// PATCH /api/admin/users/:id role
+router.patch('/users/:id', async (req, res) => {
+	const admin = await requireAdmin(req, res);
+	if (!admin) return;
+
+	const id = String(req.params.id || '').trim();
+	const role = String(req.body?.role || '').trim();
+	if (!id) return res.status(400).json({ success: false, error: 'id is required' });
+	if (!role) return res.status(400).json({ success: false, error: 'role is required' });
+
+	try {
+		const supabase = createAuthServiceClient();
+		const { data, error } = await supabase
+			.from('profiles')
+			.upsert({ id, role }, { onConflict: 'id' })
+			.select('id,role')
+			.single();
+		if (error) return res.status(400).json({ success: false, error: error.message });
+		return res.json({ success: true, profile: data });
+	} catch (e) {
+		console.error('Admin update role failed', e);
 		return res.status(500).json({ success: false, error: e?.message || 'Admin request failed' });
 	}
 });
